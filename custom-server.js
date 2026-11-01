@@ -46,6 +46,65 @@ function startBackgroundTokenRefreshFromCustomServer() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Self-pinger: keeps the service awake on hosts that sleep idle instances
+// (e.g. Render free tier spins down after ~15 min without inbound traffic).
+// Pings the PUBLIC URL so the request goes through Render's proxy and counts
+// as real inbound traffic. A loopback ping would NOT prevent spin-down.
+//
+// Env:
+//   SELF_PING_URL         Override target URL (defaults to RENDER_EXTERNAL_URL,
+//                         which Render sets automatically).
+//   SELF_PING_INTERVAL_MS Interval in ms (default 180000 = 180s).
+//   SELF_PING_DISABLED    Set to "1"/"true" to turn it off.
+// ---------------------------------------------------------------------------
+const SELF_PING_INTERVAL_MS = Number(process.env.SELF_PING_INTERVAL_MS) || 180 * 1000;
+let selfPingTimer = null;
+
+function startSelfPing() {
+  if (selfPingTimer) return;
+  const disabled = String(process.env.SELF_PING_DISABLED || "").toLowerCase();
+  if (disabled === "1" || disabled === "true") return;
+
+  const target = process.env.SELF_PING_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!target) {
+    console.log("[SelfPing] disabled: set SELF_PING_URL (or run on Render for RENDER_EXTERNAL_URL)");
+    return;
+  }
+  if (typeof fetch !== "function") {
+    console.error("[SelfPing] disabled: global fetch unavailable (Node 18+ required)");
+    return;
+  }
+
+  const ping = async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30 * 1000);
+    try {
+      const res = await fetch(target, {
+        method: "GET",
+        headers: { "user-agent": "9router-self-ping" },
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      console.log(`[SelfPing] ${new Date().toISOString()} ${target} -> ${res.status}`);
+    } catch (e) {
+      console.error("[SelfPing] failed:", e && e.message ? e.message : e);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  selfPingTimer = setInterval(ping, SELF_PING_INTERVAL_MS);
+  if (typeof selfPingTimer.unref === "function") selfPingTimer.unref();
+  const stop = () => {
+    if (selfPingTimer) clearInterval(selfPingTimer);
+    selfPingTimer = null;
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  console.log(`[SelfPing] started: ${target} every ${Math.round(SELF_PING_INTERVAL_MS / 1000)}s`);
+}
+
 // Wrap Next standalone HTTP server: derive client IP from the TCP socket
 // (unspoofable) and strip client-supplied forwarding headers so downstream
 // rate-limiting keys on the real peer address instead of attacker-controlled XFF.
@@ -75,6 +134,7 @@ http.createServer = (...args) => {
   const server = origCreate(...rest, wrapped);
   server.once("listening", () => {
     startBackgroundTokenRefreshFromCustomServer();
+    startSelfPing();
   });
   const origEmit = server.emit;
   // JBR 25 sends h2c upgrades that the HTTP/1.1 server would otherwise close.
